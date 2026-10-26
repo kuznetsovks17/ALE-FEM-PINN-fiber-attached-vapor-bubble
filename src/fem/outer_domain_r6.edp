@@ -1,0 +1,893 @@
+// ============================================================================
+// Point 11 -- provisional production viscous fiber FreeFEM solver v8 (fixed-point Picard with tangential ALE gauge)
+//
+// v4 retains the exact q gauge and harmonic interior ALE, and adds a
+// free-boundary Picard corrector. Each timestep is repeatedly regenerated
+// from the same accepted base mesh until both the exact-gauge compatibility
+// multiplier and the BDF2 interface kinematic residual are small.
+//
+// v3 retains the v2 exact-gauge/BDF-coordinate corrections and adds:
+//   * harmonic interior ALE smoothing on the unified mesh;
+//   * the free interface follows AB2-extrapolated fluid velocity via a
+//     strong internal-edge penalty, while solid/outer boundaries are fixed.
+//
+// v2 corrections relative to v1:
+//   1) Enforce the PHYSICAL vapor gauge exactly:
+//          integral_V x*qV dA = 0
+//      with one scalar Lagrange multiplier in an augmented block system.
+//      The scalar multiplier is reported as gCorr; it is the uniform continuity
+//      correction required because the interface geometry is still advanced
+//      explicitly.  A physically consistent free-boundary update should drive
+//      gCorr toward zero as dt is reduced / coupling is tightened.
+//
+//   2) Distinguish:
+//        * AB2 predicted fluid velocity used to PLACE the next mesh, and
+//        * actual BE/BDF2 derivative of mesh coordinates used as ALE velocity
+//          in the momentum equations.
+//
+// Everything else remains the provisional production branch:
+// axisymmetric, pinned fiber rim, no phase change, no surface tension,
+// viscous P2/P1/P1 two-phase formulation, geometric Vv thermodynamics,
+// open ambient traction on the artificial box.
+// ============================================================================
+
+verbosity = 1;
+
+// ------------------------------ run controls ---------------------------------
+real dt = 0.005;
+int nstep = 60;
+real meshFactor = 0.75;
+
+// Free-boundary Picard controls.
+int maxPicard = 10;
+real relaxPicard = 0.70;
+// Picard convergence is judged by CHANGE BETWEEN ITERATIONS.
+// The nonzero fixed-mesh floors in gCorr and kinN are retained as
+// spatial-discretization diagnostics for Point 12.
+real tolVpic = 1.0e-7;
+real tolCorrpic = 5.0e-4;
+real tolKinpic = 5.0e-3;
+int minPicard = 4;
+
+// --------------------------- nondimensional physics ---------------------------
+real Re       = 500.0;
+real Pi       = 1.25;
+real pv0      = -1.0;
+real gammaV   = 1.0;
+real rhoV0    = 0.02;
+real muRatio  = 0.02;
+real pinf     = 0.0;
+
+real muL      = 1.0/Re;
+real muV      = muRatio/Re;
+
+// ------------------------------- geometry ------------------------------------
+real af       = 300.0/686.0;
+
+// Baseline production box used to BUILD the exact production mesh topology.
+real rMax     = 4.0;
+real zMin     = -2.0;
+real zMax     = 4.0;
+
+// Target artificial boundary for this outer-domain sensitivity run.
+real rOuterTarget = 6;
+real zOuterMinTarget = -3;
+real zOuterMaxTarget = 6;
+
+real zc       = sqrt(1.0-af*af);
+real thRim    = acos(-zc);
+
+// Smooth ALE plateau / outer taper.
+real rPlate    = 2.5;
+real zTopPlate = 2.5;
+real zBotPlate = -0.25;
+
+// ------------------------------ boundary labels ------------------------------
+int AXIS   = 1;
+int FIBER  = 2;
+int BOTTOM = 3;
+int FARR   = 4;
+int FARZ   = 5;
+int IFACE  = 6;
+int VTIP   = 7;
+
+int REGV = 101;
+int REGL = 202;
+
+// ------------------------------- initial mesh --------------------------------
+int nArc    = int(112*meshFactor + 0.5);
+int nTip    = int(48*meshFactor + 0.5);
+int nAxisV  = int(70*meshFactor + 0.5);
+int nAxisL  = int(100*meshFactor + 0.5);
+int nFiber  = int(55*meshFactor + 0.5);
+int nBottom = int(100*meshFactor + 0.5);
+int nFarR   = int(100*meshFactor + 0.5);
+int nFarZ   = int(100*meshFactor + 0.5);
+
+border vTip(s=0,1) {
+    x=af*s; y=0.0; label=VTIP;
+}
+border vArc(s=0,1) {
+    real th=thRim*(1.0-s);
+    x=sin(th);
+    y=zc+cos(th);
+    label=IFACE;
+}
+border vAxis(s=0,1) {
+    x=0.0;
+    y=(zc+1.0)*(1.0-s);
+    label=AXIS;
+}
+mesh ThV = buildmesh(vTip(nTip)+vArc(nArc)+vAxis(nAxisV),
+                     fixedborder=true);
+ThV = change(ThV,fregion=REGV);
+
+border lAxis(s=0,1) {
+    x=0.0;
+    y=zMax+(zc+1.0-zMax)*s;
+    label=AXIS;
+}
+border lArc(s=0,1) {
+    real th=thRim*s;
+    x=sin(th);
+    y=zc+cos(th);
+    label=IFACE;
+}
+border lFiber(s=0,1) {
+    x=af;
+    y=zMin*s;
+    label=FIBER;
+}
+border lBottom(s=0,1) {
+    x=af+(rMax-af)*s;
+    y=zMin;
+    label=BOTTOM;
+}
+border lFarR(s=0,1) {
+    x=rMax;
+    y=zMin+(zMax-zMin)*s;
+    label=FARR;
+}
+border lFarZ(s=0,1) {
+    x=rMax*(1.0-s);
+    y=zMax;
+    label=FARZ;
+}
+mesh ThL = buildmesh(lAxis(nAxisL)+lArc(nArc)+lFiber(nFiber)
+                    +lBottom(nBottom)+lFarR(nFarR)+lFarZ(nFarZ),
+                     fixedborder=true);
+ThL = change(ThL,fregion=REGL);
+
+// -----------------------------------------------------------------------------
+// Outer-domain stretch with EXACTLY the production mesh connectivity.
+// The map is identity in the dynamically important near field:
+//   r <= rPlate, zBotPlate <= z <= zTopPlate.
+// Beyond that plateau it stretches monotonically to the new artificial box.
+// The vapor/interface geometry is untouched because it lies inside the identity region.
+// This adds NO vertices or triangles, so Xh.ndof is the production value.
+// -----------------------------------------------------------------------------
+func real stretchR(real rr) {
+    if (rr <= rPlate) return rr;
+    return rPlate + (rr-rPlate)*(rOuterTarget-rPlate)/(rMax-rPlate);
+}
+func real stretchZ(real zz) {
+    if (zz > zTopPlate)
+        return zTopPlate + (zz-zTopPlate)*(zOuterMaxTarget-zTopPlate)/(zMax-zTopPlate);
+    if (zz < zBotPlate)
+        return zBotPlate + (zz-zBotPlate)*(zOuterMinTarget-zBotPlate)/(zMin-zBotPlate);
+    return zz;
+}
+
+ThL = movemesh(ThL,[stretchR(x),stretchZ(y)]);
+ThL = change(ThL,fregion=REGL);
+
+mesh ThU = ThL + ThV;
+
+real wV0 = int2d(ThV)(x);
+real Vv0 = 2.0*pi*wV0;
+
+// ------------------------- thermodynamic functions ---------------------------
+func real pvvol(real vr) {
+    return (Pi+pv0)*pow(1.0/max(vr,1.0e-30),gammaV)-Pi;
+}
+func real rhovol(real vr) {
+    return rhoV0/max(vr,1.0e-30);
+}
+
+// -------------------------- axisymmetric operators ----------------------------
+macro DivA(ur,uz) (dx(ur) + ur/max(x,1.0e-10) + dy(uz)) //
+macro ViscA(ur,uz,vr,vz) (2.0*dx(ur)*dx(vr) + 2.0*dy(uz)*dy(vz) + 2.0*(ur/max(x,1.0e-10))*(vr/max(x,1.0e-10)) + (dy(ur)+dx(uz))*(dy(vr)+dx(vz))) //
+
+// ------------------------------- FE spaces -----------------------------------
+fespace Uh(ThU,[P2,P2]);
+fespace PL(ThL,P1);
+fespace QV(ThV,P1);
+
+// Composite system space for manual block assembly.
+fespace Xh = Uh*PL*QV;
+
+// P1 coordinate-history space on the unified mesh.
+fespace Ch(ThU,[P1,P1]);
+
+// Harmonic ALE mesh-velocity space and internal-edge indicator.
+// The interface is an internal edge after gluing, so its location is identified
+// from the jump in persistent triangle region labels.
+fespace Mh(ThU,[P1,P1]);
+fespace Eh(ThU,P0edge);
+
+Uh [ur,uz]=[0,0], [vr,vz];
+Uh [urold,uzold]=[0,0];
+Uh [uolder,zolder]=[0,0];
+
+// AB2 interface target and actual BDF ALE mesh velocity.
+Uh [wpr,wpz]=[0,0];
+Uh [wmr,wmz]=[0,0];
+
+// Harmonic interior mesh predictor.
+Mh [wsr,wsz]=[0,0], [msr,msz];
+Eh ChiE=0;
+
+PL pL=0, phiL;
+QV qV=0, etaV;
+
+Ch [cbr,cbz]=[x,y];
+Ch [cor,coz]=[x,y];
+
+// ----------------------- BDF2/Oseen scalar coefficients ----------------------
+real a0=1.0/dt;
+real a1=-1.0/dt;
+real a2=0.0;
+
+real b1=1.0;
+real b2=0.0;
+
+real c1=1.0;
+real c2=0.0;
+
+// -------------------------- harmonic ALE extension ---------------------------
+// The PHYSICAL free-surface kinematic condition is checked only in the
+// NORMAL direction.  Tangential interface mesh velocity is a free ALE gauge.
+// For mesh robustness we choose that tangential gauge equal to the current
+// fluid tangential target, so MeshSmooth enforces the full vector target while
+// only the normal component is used as a physical residual.
+//
+// Interior nodes solve a Laplace smoothing problem with rigid solid and
+// artificial outer boundaries fixed.
+real penMesh = 1.0e8;
+
+problem MeshSmooth(
+    <[wsr,wsz]>,
+    <[msr,msz]>,
+    solver=UMFPACK
+) =
+    int2d(ThU)(
+        dx(wsr)*dx(msr) + dy(wsr)*dy(msr)
+      + dx(wsz)*dx(msz) + dy(wsz)*dy(msz)
+    )
+  + intalledges(ThU)(
+        ChiE*penMesh*(wsr*msr + wsz*msz)/nTonEdge
+    )
+  - intalledges(ThU)(
+        ChiE*penMesh*(wpr*msr + wpz*msz)/nTonEdge
+    )
+  + on(FIBER,VTIP,FARR,FARZ,BOTTOM,wsr=0,wsz=0)
+  + on(AXIS,wsr=0)
+  ;
+
+// -------------------------- thermodynamic history ----------------------------
+real time=0.0;
+real Vv=Vv0;
+real Vvold=Vv0;
+real Vvolder=Vv0;
+real volratio=1.0;
+
+real Pv=pv0;
+real rhoV=rhoV0;
+real gV=0.0;
+
+// Velocity coefficient histories.
+real[int] old1store(ur[].n);
+real[int] old2store(ur[].n);
+old1store = ur[];
+old2store = ur[];
+
+// Older accepted mesh coordinates on fixed topology.
+// At startup X^{-1}=X^0, consistent with BE first step.
+real[int] coordOlder(cor[].n);
+coordOlder = cor[];
+
+// -------------------------- monolithic VARF ----------------------------------
+// Matrix/current-unknown terms + RHS terms in M*x=b convention.
+//
+// Exact q mean is NOT approximated by a local epsilon*q*eta term.  The global
+// constraint is added as one block row/column below.
+varf FiberVF(
+    <[ur,uz],[pL],[qV]>,
+    <[vr,vz],[phiL],[etaV]>
+) =
+   // --------------------------- matrix: liquid -------------------------------
+   int2d(ThL)(
+       x*a0*(ur*vr + uz*vz)
+     + x*((b1*urold+b2*uolder-wmr)*dx(ur)
+         +(b1*uzold+b2*zolder-wmz)*dy(ur))*vr
+     + x*((b1*urold+b2*uolder-wmr)*dx(uz)
+         +(b1*uzold+b2*zolder-wmz)*dy(uz))*vz
+     + x*muL*ViscA(ur,uz,vr,vz)
+     - x*pL*DivA(vr,vz)
+     - x*phiL*DivA(ur,uz)
+   )
+
+   // ---------------------------- matrix: vapor -------------------------------
+ + int2d(ThV)(
+       x*rhoV*a0*(ur*vr + uz*vz)
+     + x*rhoV*((b1*urold+b2*uolder-wmr)*dx(ur)
+              +(b1*uzold+b2*zolder-wmz)*dy(ur))*vr
+     + x*rhoV*((b1*urold+b2*uolder-wmr)*dx(uz)
+              +(b1*uzold+b2*zolder-wmz)*dy(uz))*vz
+     + x*muV*ViscA(ur,uz,vr,vz)
+     - x*rhoV*qV*DivA(vr,vz)
+     - x*rhoV*etaV*DivA(ur,uz)
+   )
+
+   // ------------------------------ RHS: histories ----------------------------
+   // Opposite sign of the history terms from the residual form.
+ - int2d(ThL)(
+       x*a1*(urold*vr + uzold*vz)
+     + x*a2*(uolder*vr + zolder*vz)
+   )
+
+ - int2d(ThV)(
+       x*rhoV*a1*(urold*vr + uzold*vz)
+     + x*rhoV*a2*(uolder*vr + zolder*vz)
+   )
+
+   // Uniform vapor thermodynamic pressure:
+   // residual had -Pv*div(v), therefore RHS is +Pv*div(v).
+ + int2d(ThV)(
+       x*Pv*DivA(vr,vz)
+   )
+
+   // Vapor continuity:
+   // residual had +rho*eta*gV, therefore RHS is -rho*eta*gV.
+ - int2d(ThV)(
+       x*rhoV*etaV*gV
+   )
+
+   // Zero Dirichlet constraints.
+ + on(FIBER, ur=0, uz=0)
+ + on(VTIP,  ur=0, uz=0)
+ + on(AXIS,  ur=0)
+ ;
+
+// Constraint vector B_j = integral x*rhoV*eta_j dA.
+// The augmented system
+//    [A B; B' 0] [solution; gCorr] = [rhs; 0]
+// imposes B'*solution = integral x*rhoV*qV dA = 0.
+// In the continuity row it gives
+//    div(u_v) = gV + gCorr,
+// so gCorr directly measures explicit free-boundary compatibility error.
+varf GaugeVF(
+    <[ur,uz],[pL],[qV]>,
+    <[vr,vz],[phiL],[etaV]>
+) =
+    int2d(ThV)(
+        x*rhoV*etaV
+    )
+  ;
+
+// --------------------------- diagnostic spaces -------------------------------
+fespace DL(ThL,P1dc);
+fespace DV(ThV,P1dc);
+
+DL divL;
+DV divV;
+DV divVeff;
+
+// -------------------- Point 2/3 deformation + interface export ----------------
+// Publication-only diagnostics.  These DO NOT alter the weak form, ALE motion,
+// Picard iteration, constitutive laws, or time integration.
+//
+// Geometry convention for the attached vapor cap:
+//   H(t)    = maximum vapor z-coordinate measured from the fixed tip plane z=0
+//   Rmax(t) = maximum vapor radial coordinate
+//   W(t)    = 2 Rmax(t)
+// Because the initial attached cap is not a full sphere, anisotropy is measured
+// relative to its own t=0 geometry:
+//   lambdaZ = H/H0, lambdaR = Rmax/Rmax0
+//   aspectRel = lambdaZ/lambdaR
+//   Drel = (lambdaZ-lambdaR)/(lambdaZ+lambdaR)
+// Thus aspectRel=1 and Drel=0 exactly at t=0.
+
+real H0=-1.0e30;
+real Rmax0=0.0;
+for (int iv0=0; iv0<ThV.nv; ++iv0) {
+    if (ThV(iv0).y > H0) H0 = ThV(iv0).y;
+    if (ThV(iv0).x > Rmax0) Rmax0 = ThV(iv0).x;
+}
+real aspect0 = H0/(2.0*Rmax0+1.0e-30);
+real Zcent0 = int2d(ThV)(x*y)/(wV0+1.0e-30);
+real Req0 = pow(3.0*Vv0/(4.0*pi),1.0/3.0);
+
+ofstream deformOut("outer_stretch_r6_zm3_z6_deformationMetrics.csv");
+deformOut << "step,t,Vratio,Req,Zcent,H,Rmax,width,lambdaZ,lambdaR,aspect,aspectRel,Drel" << endl;
+deformOut << 0 << "," << 0.0 << "," << 1.0 << "," << Req0 << "," << Zcent0 << ","
+          << H0 << "," << Rmax0 << "," << 2.0*Rmax0 << ","
+          << 1.0 << "," << 1.0 << "," << aspect0 << "," << 1.0 << "," << 0.0 << endl;
+
+// Export every accepted interface, not only the four planned figure times.  The
+// resulting file is small and prevents an expensive rerun if another snapshot
+// time is desired later.  Boundary-edge endpoints are intentionally duplicated;
+// downstream post-processing removes duplicate (r,z) pairs and sorts by z.
+ofstream ifaceOut("outer_stretch_r6_zm3_z6_interfaceSnapshots.csv");
+ifaceOut << "step,t,edge,endpoint,r,z" << endl;
+for (int kb0=0; kb0<ThV.nbe; ++kb0) {
+    if (ThV.be(kb0).label == IFACE) {
+        int va0 = ThV.be(kb0)[0];
+        int vb0 = ThV.be(kb0)[1];
+        ifaceOut << 0 << "," << 0.0 << "," << kb0 << "," << 0 << "," << ThV(va0).x << "," << ThV(va0).y << endl;
+        ifaceOut << 0 << "," << 0.0 << "," << kb0 << "," << 1 << "," << ThV(vb0).x << "," << ThV(vb0).y << endl;
+    }
+}
+
+// ------------------------------ scalar output --------------------------------
+ofstream out("outer_stretch_r6_zm3_z6_scalars.csv");
+out << "step,t,dt,picard,Vv,Vratio,Req,Zcent,Pv,rhoV,gV,gCorr,corrRel,dVpic,dCorrpic,dKinpic,"
+    << "qMeanRaw,divLRMS,divVRMS,divVRelative,divVEffRMS,"
+    << "kinNormalBDFRMS,maxSpeed,meanFiberSideP,meanTipP,meshBCNormalErr,"
+    << "regErrV,regErrL,minAreaU,minAreaL,minAreaV" << endl;
+
+cout << "============================================================" << endl;
+cout << "OUTER-DOMAIN SENSITIVITY -- stretched production topology (r6_zm3_z6)" << endl;
+cout << "dt=" << dt << " nstep=" << nstep
+     << " meshFactor=" << meshFactor << endl;
+cout << "af=" << af << " zc=" << zc
+     << " Vv0=" << Vv0 << endl;
+cout << "baseline build box: r=[0," << rMax << "] z=[" << zMin << "," << zMax << "]" << endl;
+cout << "stretched physical box: r=[0," << rOuterTarget << "] z=[" << zOuterMinTarget << "," << zOuterMaxTarget << "]" << endl;
+cout << "same topology: ThL.nt=" << ThL.nt << " ThV.nt=" << ThV.nt
+     << " ThU.nt=" << ThU.nt << " Xh.ndof=" << Xh.ndof
+     << " augmentedDOF=" << Xh.ndof+1 << endl;
+cout << "Near field unchanged for r<=2.5 and -0.25<=z<=2.5." << endl;
+cout << "NO analytical trajectory/reference is supplied." << endl;
+cout << "q mean exact; Picard stops when the discrete free-boundary iterate stops changing." << endl;
+cout << "============================================================" << endl;
+
+// Accepted base meshes. Every Picard trial in a physical timestep is
+// regenerated directly from these meshes; topology and coefficient ordering
+// therefore remain unchanged.
+mesh ThUb = ThU;
+mesh ThLb = ThL;
+mesh ThVb = ThV;
+
+// ------------------------------- time loop -----------------------------------
+for (int istep=1; istep<=nstep; ++istep) {
+
+    time = istep*dt;
+
+    if (istep==1) {
+        a0=1.0/dt;
+        a1=-1.0/dt;
+        a2=0.0;
+        b1=1.0;
+        b2=0.0;
+        c1=1.0;
+        c2=0.0;
+    } else {
+        a0=1.5/dt;
+        a1=-2.0/dt;
+        a2=0.5/dt;
+        b1=2.0;
+        b2=-1.0;
+        c1=1.5;
+        c2=-0.5;
+    }
+
+    // Freeze the accepted base geometry for every Picard trial at this step.
+    ThUb = ThU;
+    ThLb = ThL;
+    ThVb = ThV;
+
+    // Accepted X^n coordinates and X^{n-1} coordinate history.
+    [cbr,cbz]=[x,y];
+    real[int] coordBase(cbr[].n);
+    coordBase = cbr[];
+
+    // Reconstruct accepted velocity histories on X^n.
+    [urold,uzold]=[0,0];
+    urold[] = old1store;
+
+    [uolder,zolder]=[0,0];
+    uolder[] = old2store;
+
+    [cor,coz]=[0,0];
+    cor[] = coordOlder;
+
+    // Robust Picard seed: use the accepted current velocity, not an AB2
+    // extrapolation.  The converged trial is still BDF2-consistent because all
+    // subsequent Picard targets are rebuilt from u^{n+1}; this changes only the
+    // nonlinear initial guess and avoids predictor overshoot.
+    [wpr,wpz] = [urold,uzold];
+    real[int] targetStore(wpr[].n);
+    targetStore = wpr[];
+
+    // Trial/result scalars that survive the Picard loop.
+    real gCorr=0.0;
+    real corrRel=1.0e30;
+    real dVpic=1.0e30;
+    real dCorrpic=1.0e30;
+    real dKinpic=1.0e30;
+    real prevVratio=1.0e30;
+    real prevGcorr=1.0e30;
+    real prevKin=1.0e30;
+    real qMeanRaw=0.0;
+    real divLRMS=0.0;
+    real divVRMS=0.0;
+    real divVRelative=0.0;
+    real divVEffRMS=0.0;
+    real kinNormalBDFRMS=0.0;
+    real maxSpeed=0.0;
+    real meanFiberSideP=0.0;
+    real meanTipP=0.0;
+    real meshBCNormalErr=0.0;
+    real regErrV=0.0;
+    real regErrL=0.0;
+    real minAreaU=0.0;
+    real minAreaL=0.0;
+    real minAreaV=0.0;
+    real Req=0.0;
+    real Zcent=0.0;
+    int usedPicard=0;
+    int stepGood=0;
+
+    for (int ip=0; ip<maxPicard; ++ip) {
+
+        usedPicard = ip+1;
+
+        // Restore the SAME accepted base meshes before generating this trial.
+        ThU = ThUb;
+        ThL = ThLb;
+        ThV = ThVb;
+
+        // Restore accepted histories on the base topology.
+        [urold,uzold]=[0,0];
+        urold[] = old1store;
+
+        [uolder,zolder]=[0,0];
+        uolder[] = old2store;
+
+        [cbr,cbz]=[0,0];
+        cbr[] = coordBase;
+
+        [cor,coz]=[0,0];
+        cor[] = coordOlder;
+
+        [wpr,wpz]=[0,0];
+        wpr[] = targetStore;
+
+        // Rebuild internal liquid-vapor edge indicator on the base mesh.
+        ChiE[] = 0;
+        for (int kk=0; kk<ThU.nt; ++kk) {
+            for (int ee0=0; ee0<3; ++ee0) {
+                int ee = ee0;
+                int ka = ThU[kk].adj(ee);
+                if ((ka>=0) && (ka!=kk)) {
+                    if (ThU[kk].region != ThU[ka].region)
+                        ChiE[][Eh(kk,ee0)] = 1.0;
+                }
+            }
+        }
+
+        // Harmonic extension of the current interface displacement-rate target.
+        [wsr,wsz]=[0,0];
+        MeshSmooth;
+
+        real ifaceMeshMeasure = intalledges(ThU)(ChiE/nTonEdge);
+        meshBCNormalErr = sqrt(
+            intalledges(ThU)(
+                ChiE*pow((wsr-wpr)*N.x+(wsz-wpz)*N.y,2.0)/nTonEdge
+            )/(ifaceMeshMeasure+1.0e-30)
+        );
+
+        // Trial geometry from accepted base mesh.
+        minAreaU = checkmovemesh(ThU,[x+dt*wsr,y+dt*wsz]);
+        minAreaL = checkmovemesh(ThL,[x+dt*wsr,y+dt*wsz]);
+        minAreaV = checkmovemesh(ThV,[x+dt*wsr,y+dt*wsz]);
+
+        if ((minAreaU<=0) || (minAreaL<=0) || (minAreaV<=0)) {
+            cout << "ERROR Picard harmonic ALE inversion step=" << istep
+                 << " it=" << usedPicard
+                 << " areas=" << minAreaU << " "
+                 << minAreaL << " " << minAreaV << endl;
+            break;
+        }
+
+        ThU = movemesh(ThUb,[x+dt*wsr,y+dt*wsz]);
+        ThL = movemesh(ThLb,[x+dt*wsr,y+dt*wsz]);
+        ThV = movemesh(ThVb,[x+dt*wsr,y+dt*wsz]);
+
+        // Rebind accepted field and coordinate histories to trial labels.
+        [urold,uzold]=[0,0];
+        urold[] = old1store;
+
+        [uolder,zolder]=[0,0];
+        uolder[] = old2store;
+
+        [cbr,cbz]=[0,0];
+        cbr[] = coordBase;
+
+        [cor,coz]=[0,0];
+        cor[] = coordOlder;
+
+        // True BE/BDF2 ALE mesh velocity on the trial geometry.
+        if (istep==1) {
+            [wmr,wmz] = [(x-cbr)/dt,(y-cbz)/dt];
+        } else {
+            [wmr,wmz] = [
+                (1.5*x-2.0*cbr+0.5*cor)/dt,
+                (1.5*y-2.0*cbz+0.5*coz)/dt
+            ];
+        }
+
+        // Initial field for the trial solve.
+        [ur,uz]=[0,0];
+        ur[] = old1store;
+        pL=0; phiL=0;
+        qV=0; etaV=0;
+        [vr,vz]=[0,0];
+
+        // Registration audit.
+        real volUV = int2d(ThU,REGV)(x);
+        real volUL = int2d(ThU,REGL)(x);
+        real volSepV = int2d(ThV)(x);
+        real volSepL = int2d(ThL)(x);
+
+        regErrV = abs(volUV-volSepV)/(abs(volSepV)+1.0e-30);
+        regErrL = abs(volUL-volSepL)/(abs(volSepL)+1.0e-30);
+
+        if ((regErrV>1.0e-10) || (regErrL>1.0e-10)) {
+            cout << "ERROR mesh registration step=" << istep
+                 << " it=" << usedPicard
+                 << " regV=" << regErrV
+                 << " regL=" << regErrL << endl;
+            break;
+        }
+
+        // Trial geometry -> closed-vapor thermodynamics.
+        real wV = int2d(ThV)(x);
+        Vv = 2.0*pi*wV;
+        volratio = Vv/Vv0;
+
+        Pv = pvvol(volratio);
+        rhoV = rhovol(volratio);
+
+        if (istep==1)
+            gV = (Vv-Vvold)/(dt*Vv);
+        else
+            gV = (1.5*Vv-2.0*Vvold+0.5*Vvolder)/(dt*Vv);
+
+        // Exact-gauge augmented two-phase solve.
+        matrix A = FiberVF(Xh,Xh);
+        real[int] rhs = FiberVF(0,Xh);
+        real[int] B = GaugeVF(0,Xh);
+        matrix AA = [[A,B],[B',0]];
+
+        int nmain = Xh.ndof;
+        real[int] rhs0(1);
+        rhs0 = 0.0;
+
+        real[int] bb(nmain+1);
+        bb = [rhs,rhs0];
+
+        set(AA,solver=UMFPACK);
+
+        real[int] xx(nmain+1);
+        xx = AA^-1*bb;
+
+        real[int] lag(1);
+        [ur[],pL[],qV[],lag] = xx;
+        gCorr = lag(0);
+
+        // Trial convergence diagnostics.
+        real wL = int2d(ThL)(x);
+        wV = int2d(ThV)(x);
+
+        qMeanRaw = int2d(ThV)(x*qV)/(wV+1.0e-30);
+
+        divL = DivA(ur,uz);
+        divV = DivA(ur,uz)-gV;
+        divVeff = DivA(ur,uz)-(gV+gCorr);
+
+        divLRMS = sqrt(int2d(ThL)(x*divL^2)/(wL+1.0e-30));
+        divVRMS = sqrt(int2d(ThV)(x*divV^2)/(wV+1.0e-30));
+        divVRelative = divVRMS/(abs(gV)+abs(gCorr)+1.0e-12);
+        divVEffRMS = sqrt(int2d(ThV)(x*divVeff^2)/(wV+1.0e-30));
+
+        Req = pow(3.0*Vv/(4.0*pi),1.0/3.0);
+        Zcent = int2d(ThV)(x*y)/(wV+1.0e-30);
+
+        // Physical free-surface kinematic residual: only the NORMAL component
+        // must equal the BDF derivative of the interface geometry. Tangential
+        // mesh velocity is intentionally free for mesh-quality redistribution.
+        real gMeasure = int1d(ThV,IFACE)(x);
+        kinNormalBDFRMS = sqrt(
+            int1d(ThV,IFACE)(
+                x*pow((ur-wmr)*N.x+(uz-wmz)*N.y,2.0)
+            )/(gMeasure+1.0e-30)
+        );
+
+        corrRel = abs(gCorr)/(abs(gV)+1.0e-10);
+
+        maxSpeed = sqrt(
+            max(
+                int2d(ThU)(x*(ur^2+uz^2))
+                /(int2d(ThU)(x)+1.0e-30),
+                0.0
+            )
+        );
+
+        real sideMeasure = int1d(ThL,FIBER)(x);
+        meanFiberSideP = int1d(ThL,FIBER)(x*pL)/(sideMeasure+1.0e-30);
+
+        real tipMeasure = int1d(ThV,VTIP)(x);
+        meanTipP = int1d(ThV,VTIP)(x*(Pv+rhoV*qV))
+                   /(tipMeasure+1.0e-30);
+
+        if ((istep<=3) || (ip>0)) {
+            cout << "  picard step=" << istep
+                 << " it=" << usedPicard
+                 << " Vrat=" << volratio
+                 << " gV=" << gV
+                 << " gCorr=" << gCorr
+                 << " corrRel=" << corrRel
+                 << " dV=" << dVpic
+                 << " dCorr=" << dCorrpic
+                 << " dKin=" << dKinpic
+                 << " kinN=" << kinNormalBDFRMS
+                 << " meshBCN=" << meshBCNormalErr
+                 << " minA=" << minAreaU
+                 << endl;
+        }
+
+        // Convergence of the DISCRETE Picard fixed point.
+        // gCorr and kinN need not vanish on a fixed P1 interface mesh; their
+        // decay with refinement is a Point-12 verification question.
+        if (ip>0) {
+            dVpic = abs(volratio-prevVratio)/(abs(volratio)+1.0e-14);
+            // Normalize the change in the compatibility multiplier by the
+            // physical compression-rate scale.  Dividing by tiny gCorr itself
+            // makes a converged O(1e-6) update look artificially large.
+            dCorrpic = abs(gCorr-prevGcorr)/(abs(gV)+1.0e-8);
+            dKinpic = abs(kinNormalBDFRMS-prevKin)
+                    /(abs(kinNormalBDFRMS)+1.0e-8);
+        }
+
+        if ((usedPicard>=minPicard)
+            && (dVpic<tolVpic)
+            && (dCorrpic<tolCorrpic)
+            && (dKinpic<tolKinpic)) {
+            stepGood = 1;
+            break;
+        }
+
+        prevVratio = volratio;
+        prevGcorr = gCorr;
+        prevKin = kinNormalBDFRMS;
+
+        // Do not alter the accepted trial after the final allowed solve.
+        if (ip < maxPicard-1) {
+
+            // BDF-consistent displacement-rate target that would make
+            // w_mesh^{n+1}=u^{n+1} on Gamma.
+            //
+            // BE:   Xnew = Xn + dt*u_new
+            // BDF2: Xnew = (dt*u_new + 2Xn - 0.5Xolder)/1.5
+            //
+            // Hence (Xnew-Xn)/dt =
+            //   u_new                                    (BE)
+            //   (2/3)u_new + (1/3)(Xn-Xolder)/dt        (BDF2)
+            if (istep==1) {
+                [wpr,wpz] = [ur,uz];
+            } else {
+                [wpr,wpz] = [
+                    (2.0/3.0)*ur + (1.0/3.0)*(cbr-cor)/dt,
+                    (2.0/3.0)*uz + (1.0/3.0)*(cbz-coz)/dt
+                ];
+            }
+
+            real[int] newTarget(wpr[].n);
+            newTarget = wpr[];
+
+            // Under-relaxed fixed-point update in coefficient/mesh-label space.
+            for (int jj=0; jj<targetStore.n; ++jj)
+                targetStore(jj) =
+                    (1.0-relaxPicard)*targetStore(jj)
+                  + relaxPicard*newTarget(jj);
+        }
+    }
+
+    if (stepGood==0) {
+        cout << "ERROR: free-boundary Picard did not converge step=" << istep
+             << " t=" << time
+             << " used=" << usedPicard
+             << " corrRel=" << corrRel
+             << " kinN=" << kinNormalBDFRMS
+             << endl;
+        break;
+    }
+
+    cout << "step=" << istep
+         << " t=" << time
+         << " pic=" << usedPicard
+         << " Vrat=" << volratio
+         << " Req=" << Req
+         << " Zc=" << Zcent
+         << " Pv=" << Pv
+         << " qmean=" << qMeanRaw
+         << " gV=" << gV
+         << " gCorr=" << gCorr
+         << " corrRel=" << corrRel
+         << " dV=" << dVpic
+         << " dCorr=" << dCorrpic
+         << " dKin=" << dKinpic
+         << " kinN=" << kinNormalBDFRMS
+         << " divEff=" << divVEffRMS
+         << " meshBCN=" << meshBCNormalErr
+         << " minA=" << minAreaU
+         << endl;
+
+    out << istep << "," << time << "," << dt << "," << usedPicard << ","
+        << Vv << "," << volratio << "," << Req << "," << Zcent << ","
+        << Pv << "," << rhoV << "," << gV << "," << gCorr << ","
+        << corrRel << "," << dVpic << "," << dCorrpic << "," << dKinpic << "," << qMeanRaw << ","
+        << divLRMS << "," << divVRMS << "," << divVRelative << ","
+        << divVEffRMS << "," << kinNormalBDFRMS << "," << maxSpeed << ","
+        << meanFiberSideP << "," << meanTipP << "," << meshBCNormalErr << ","
+        << regErrV << "," << regErrL << ","
+        << minAreaU << "," << minAreaL << "," << minAreaV << endl;
+
+
+    // Point 2 deformation metrics on the accepted geometry.
+    real Hcur=-1.0e30;
+    real RmaxCur=0.0;
+    for (int ivd=0; ivd<ThV.nv; ++ivd) {
+        if (ThV(ivd).y > Hcur) Hcur = ThV(ivd).y;
+        if (ThV(ivd).x > RmaxCur) RmaxCur = ThV(ivd).x;
+    }
+    real lambdaZ = Hcur/(H0+1.0e-30);
+    real lambdaR = RmaxCur/(Rmax0+1.0e-30);
+    real aspectCur = Hcur/(2.0*RmaxCur+1.0e-30);
+    real aspectRel = lambdaZ/(lambdaR+1.0e-30);
+    real Drel = (lambdaZ-lambdaR)/(lambdaZ+lambdaR+1.0e-30);
+
+    deformOut << istep << "," << time << "," << volratio << "," << Req << "," << Zcent << ","
+              << Hcur << "," << RmaxCur << "," << 2.0*RmaxCur << ","
+              << lambdaZ << "," << lambdaR << "," << aspectCur << ","
+              << aspectRel << "," << Drel << endl;
+
+    // Point 3: save the complete accepted free-interface polyline at EVERY step.
+    for (int kbd=0; kbd<ThV.nbe; ++kbd) {
+        if (ThV.be(kbd).label == IFACE) {
+            int vad = ThV.be(kbd)[0];
+            int vbd = ThV.be(kbd)[1];
+            ifaceOut << istep << "," << time << "," << kbd << "," << 0 << "," << ThV(vad).x << "," << ThV(vad).y << endl;
+            ifaceOut << istep << "," << time << "," << kbd << "," << 1 << "," << ThV(vbd).x << "," << ThV(vbd).y << endl;
+        }
+    }
+
+    // Accept converged solution and geometry.
+    old2store = old1store;
+    old1store = ur[];
+
+    coordOlder = coordBase;
+
+    Vvolder = Vvold;
+    Vvold = Vv;
+}
+
+cout << "============================================================" << endl;
+cout << "Stage 11 v8 finished at t=" << time << endl;
+cout << "Final accepted V/V0=" << Vvold/Vv0 << endl;
+cout << "CSV: outer_stretch_r6_zm3_z6_scalars.csv" << endl;
+cout << "Point-2 deformation CSV: outer_stretch_r6_zm3_z6_deformationMetrics.csv" << endl;
+cout << "Point-2/3 interface CSV: outer_stretch_r6_zm3_z6_interfaceSnapshots.csv" << endl;
+cout << "============================================================" << endl;

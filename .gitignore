@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+*:Zone.Identifier
+*.log
+*.aux
+*.out
+*.synctex.gz
+# Generated training outputs
+*.weights.h5
+!checkpoints/production_PINN_66k.weights.h5
+point16_*_report.txt
+._point16_*.py
